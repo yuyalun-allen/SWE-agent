@@ -1,0 +1,211 @@
+diff --git a/swe-agent/sweagent/agent/models.py b/SWE-agent/sweagent/agent/models.py
+index 8b2fd18..c5d3b61 100644
+--- a/swe-agent/sweagent/agent/models.py
++++ b/SWE-agent/sweagent/agent/models.py
+@@ -260,19 +260,29 @@ class HumanThoughtModelConfig(HumanModelConfig):
+     model_config = ConfigDict(extra="forbid")
+ 
+ 
++class HybridModelConfig(GenericAPIModelConfig):
++    """Model that replays a trajectory and then switches to a live LLM."""
++
++    name: Literal["hybrid"] = Field(default="hybrid", description="Model name.")
++    replay_path: Path = Field(description="Path to replay file.")
++    llm: "ModelConfig" = Field(description="The live LLM to use after replay.")
++
++    model_config = ConfigDict(extra="forbid")
++
++
+ ModelConfig = Annotated[
+     GenericAPIModelConfig
+     | ReplayModelConfig
+     | InstantEmptySubmitModelConfig
+     | HumanModelConfig
+-    | HumanThoughtModelConfig,
++    | HumanThoughtModelConfig
++    | HybridModelConfig,
+     Field(union_mode="left_to_right"),
+ ]
+ 
+ 
+ class GlobalStats(PydanticBaseModel):
+     """This class tracks usage numbers (costs etc.) across all instances."""
+-
+     total_cost: float = 0
+     """Cumulative cost for all instances so far"""
+ 
+@@ -526,6 +536,52 @@ class ReplayModel(AbstractModel):
+         return {"message": action}
+ 
+ 
++class HybridModel(AbstractModel):
++    def __init__(self, config: HybridModelConfig, tools: ToolConfig):
++        """Model that replays a trajectory and then switches to a live LLM."""
++        self.config = config
++        self.stats = InstanceStats()
++        self.logger = get_logger("swea-lm", emoji="🤖")
++
++        if not self.config.replay_path.exists():
++            msg = f"Replay file {self.config.replay_path} not found"
++            raise FileNotFoundError(msg)
++
++        self.replay_actions = list(json.loads(self.config.replay_path.read_text()).values())[0]
++        self.llm = get_model(self.config.llm, tools)
++        self._action_idx = 0
++        self.replay_done = False
++
++    @property
++    def instance_cost_limit(self) -> float:
++        """Cost limit for the model. Returns 0 if there is no limit."""
++        if self.replay_done:
++            return self.llm.instance_cost_limit
++        return 0
++
++    def query(self, history: History, **kwargs) -> dict:
++        """Logic for switching from replay to live LLM."""
++        if not self.replay_done:
++            try:
++                action = self.replay_actions[self._action_idx]
++                self._action_idx += 1
++                self.stats.api_calls += 1
++                self.logger.info(f"Replaying action {self._action_idx}/{len(self.replay_actions)}")
++                if isinstance(action, dict):
++                    return action
++                return {"message": action}
++            except IndexError:
++                self.logger.info("Replay finished. Switching to live LLM.")
++                self.replay_done = True
++        
++        # Once replay is done, delegate to the live LLM
++        result = self.llm.query(history, **kwargs)
++        # Update hybrid model's stats with the live LLM's stats
++        self.stats += self.llm.stats
++        self.llm.reset_stats()
++        return result
++
++
+ class PredeterminedTestModel(AbstractModel):
+     def __init__(self, outputs: list[dict | str]):
+         """Model that outputs a predetermined sequence of messages. Useful for testing."""
+@@ -869,7 +925,7 @@ def get_model(args: ModelConfig, tools: ToolConfig) -> AbstractModel:
+     """Returns correct model object given arguments and commands"""
+     # Convert GenericAPIModelConfig to specific model config if needed
+     if isinstance(args, GenericAPIModelConfig) and not isinstance(
+-        args, HumanModelConfig | HumanThoughtModelConfig | ReplayModelConfig | InstantEmptySubmitModelConfig
++        args, HumanModelConfig | HumanThoughtModelConfig | ReplayModelConfig | InstantEmptySubmitModelConfig | HybridModelConfig
+     ):
+         if args.name == "human":
+             args = HumanModelConfig(**args.model_dump())
+@@ -879,6 +935,8 @@ def get_model(args: ModelConfig, tools: ToolConfig) -> AbstractModel:
+             args = ReplayModelConfig(**args.model_dump())
+         elif args.name == "instant_empty_submit":
+             args = InstantEmptySubmitModelConfig(**args.model_dump())
++        elif args.name == "hybrid":
++            args = HybridModelConfig(**args.model_dump())
+ 
+     if args.name == "human":
+         assert isinstance(args, HumanModelConfig), f"Expected {HumanModelConfig}, got {args}"
+@@ -889,6 +947,9 @@ def get_model(args: ModelConfig, tools: ToolConfig) -> AbstractModel:
+     if args.name == "replay":
+         assert isinstance(args, ReplayModelConfig), f"Expected {ReplayModelConfig}, got {args}"
+         return ReplayModel(args, tools)
++    if args.name == "hybrid":
++        assert isinstance(args, HybridModelConfig), f"Expected {HybridModelConfig}, got {args}"
++        return HybridModel(args, tools)
+     elif args.name == "instant_empty_submit":
+         assert isinstance(args, InstantEmptySubmitModelConfig), f"Expected {InstantEmptySubmitModelConfig}, got {args}"
+         return InstantEmptySubmitTestModel(args, tools)
+diff --git a/swe-agent/sweagent/run/run_replay.py b/SWE-agent/sweagent/run/run_replay.py
+index 3d927d8..fcbccf9 100644
+--- a/swe-agent/sweagent/run/run_replay.py
++++ b/SWE-agent/sweagent/run/run_replay.py
+@@ -16,6 +16,10 @@ Replay a trajectory file:
+ 
+ [green]sweagent run replay --traj_path mytraj.traj[/green]
+ 
++Replay and continue with a live agent:
++
++[green]sweagent run replay --traj_path mytraj.traj --and-continue[/green]
++
+ Replay a demo file:
+ 
+ [green]sweagent run replay --traj_path mydemo.demo.yaml[/green]
+@@ -26,16 +30,18 @@ import sys
+ import tempfile
+ from getpass import getuser
+ from pathlib import Path
+-from typing import Any
++from typing import Annotated, Any
+ 
+ import yaml
++from pydantic import Field
+ from pydantic_settings import BaseSettings, SettingsConfigDict
++from pydantic_settings.sources import CliImplicitFlag
+ from swerex.deployment.abstract import AbstractDeployment
+ from swerex.deployment.config import DeploymentConfig, get_deployment
+ from typing_extensions import Self
+ 
+ from sweagent.agent.agents import DefaultAgent
+-from sweagent.agent.models import ReplayModelConfig
++from sweagent.agent.models import HybridModelConfig, ReplayModelConfig
+ from sweagent.environment.swe_env import SWEEnv
+ from sweagent.run.common import BasicCLI, ConfigHelper
+ from sweagent.run.run_single import RunSingle, RunSingleConfig
+@@ -43,7 +49,7 @@ from sweagent.utils.config import load_environment_variables
+ from sweagent.utils.log import get_logger
+ 
+ 
+-class RunReplayConfig(BaseSettings, cli_implicit_flags=False):
++class RunReplayConfig(BaseSettings, cli_implicit_flags=True):
+     traj_path: Path
+     deployment: DeploymentConfig | None = None
+     """Override the deployment in the trajectory."""
+@@ -52,6 +58,7 @@ class RunReplayConfig(BaseSettings, cli_implicit_flags=False):
+     """Path to a .env file to load environment variables from."""
+     update_config: list[Path] = []
+     """Additional config files to merge with the replay config."""
++    and_continue: bool = False
+ 
+     # pydantic config
+     model_config = SettingsConfigDict(extra="forbid", env_prefix="SWE_AGENT_")
+@@ -71,6 +78,7 @@ class RunReplay:
+         deployment: AbstractDeployment | None,
+         output_dir: Path,
+         update_config: list[Path] | None = None,
++        and_continue: bool = False,
+         _catch_errors: bool = False,
+         _require_zero_exit_code: bool = False,
+     ):
+@@ -81,6 +89,7 @@ class RunReplay:
+         self._catch_errors = _catch_errors
+         self._require_zero_exit_code = _require_zero_exit_code
+         self._update_config = update_config if update_config is not None else []
++        self._and_continue = and_continue
+ 
+         if traj_path.suffix == ".yaml":
+             self._traj_data = yaml.safe_load(traj_path.read_text())
+@@ -117,7 +126,15 @@ class RunReplay:
+ 
+             config = RunSingleConfig.model_validate(merged_dict)
+ 
+-        config.agent.model = ReplayModelConfig(replay_path=self._replay_action_trajs_path)
++        if self._and_continue:
++            self.logger.info("Using HybridModel for replay and continue.")
++            original_llm_config = config.agent.model
++            config.agent.model = HybridModelConfig(
++                replay_path=self._replay_action_trajs_path,
++                llm=original_llm_config,
++            )
++        else:
++            config.agent.model = ReplayModelConfig(replay_path=self._replay_action_trajs_path)
+         return config
+ 
+     @property
+@@ -132,6 +149,7 @@ class RunReplay:
+             deployment=get_deployment(config.deployment) if config.deployment else None,
+             output_dir=config.output_dir,
+             update_config=config.update_config,
++            and_continue=config.and_continue,
+             **kwargs,
+         )
+ 
