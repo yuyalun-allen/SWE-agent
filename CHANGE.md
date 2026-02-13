@@ -48,4 +48,4 @@ uv run sweagent run-replay --traj_path trajectories/allen/no_config__dashscope--
 uv run sweagent run-replay --traj_path trajectories/allen/no_config__dashscope--qwen3-max__t-0.00__p-1.00__c-0.00___SWE-agent__test-repo-i1/remove_half_way/SWE-agent__test-repo-i1.traj --and_continue
 ```
 
-具体代码变更参见代码仓库。
+具体代码变更参见 `patch.diff`。
