@@ -36,7 +36,7 @@ run_single 下面没有 agent 了，取而代之的是 flow。
 uv run sweagent run --env.repo.github_url=https://github.com/SWE-agent/test-repo   --problem_statement.github_url=https://github.com/SWE-agent/test-repo/issues/1
 ```
 
-然后在删除最后的 submit action traj 上以 `__and_continue` flag 运行 `run-replay`。
+然后在删除最后的 submit action traj 上以 `--and_continue` flag 运行 `run-replay`。
 
 ```bash
 uv run sweagent run-replay --traj_path trajectories/allen/no_config__dashscope--qwen3-max__t-0.00__p-1.00__c-0.00___SWE-agent__test-repo-i1/remove_submission/SWE-agent__test-repo-i1.traj --and_continue
@@ -48,4 +48,4 @@ uv run sweagent run-replay --traj_path trajectories/allen/no_config__dashscope--
 uv run sweagent run-replay --traj_path trajectories/allen/no_config__dashscope--qwen3-max__t-0.00__p-1.00__c-0.00___SWE-agent__test-repo-i1/remove_half_way/SWE-agent__test-repo-i1.traj --and_continue
 ```
 
-具体代码变更参见 `patch.diff`。
+具体代码变更参见 `patch.diff`，对应的 SWE-agent 的 base commit 为 77f0a5ea8849640c87a5d2498a9a089740108710。
